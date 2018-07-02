@@ -35,7 +35,6 @@
 #include <utility>
 #include "./operator_common.h"
 #include "./mshadow_op.h"
-#include <nccl.h>
 #include <pthread.h>
 #include <cuda_runtime.h>
 #include <cstdlib>
@@ -45,7 +44,7 @@ extern char **environ;
 
 namespace mxnet {
     namespace op {
-
+/*
 #define NCCLCHECK(cmd) do {                             \
     ncclResult_t r=cmd;                                 \
     if(r!=ncclSuccess){                                 \
@@ -63,7 +62,7 @@ namespace mxnet {
         exit(EXIT_FAILURE);                             \
     }                                                   \
 }while(0)
-
+*/
 
     static pthread_mutex_t mm = PTHREAD_MUTEX_INITIALIZER;
     static pthread_barrier_t  barrierFor,barrierBack;
@@ -116,7 +115,11 @@ class BatchNormV1Op : public Operator {
     public:
         explicit BatchNormV1Op(BatchNormV1Param param) {
             this->param_ = param;
-            //std::cout<<"init "<<initCount<<std::endl;
+            sharedGrad.nDev = param_.nGPUs;
+	        sharedProd.nDev = param_.nGPUs;
+            sharedVar.nDev = param_.nGPUs;
+	        sharedMean.nDev = param_.nGPUs;
+	    //std::cout<<"init "<<initCount<<std::endl;
         }
         ~BatchNormV1Op()
         {
@@ -187,37 +190,50 @@ class BatchNormV1Op : public Operator {
                 //Global BN using sharedTensor
                
                 if(param_.global_bn){
-                        
-                    pthread_mutex_lock(&mm);
-                    myRank = rankFor;
-                    rankFor += 1;
+                    mean = mean * 1.0f / param_.nGPUs;
+        		    var = var * 1.0f / param_.nGPUs;   
+                    
+		            pthread_mutex_lock(&mm);
+                    if(myRank == -1){
+		        	myRank = rankFor;
+                	rankFor += 1;
+		            sharedVar.nDev = param_.nGPUs;
+	                sharedMean.nDev = param_.nGPUs;
+		           }
                     pthread_mutex_unlock(&mm);
                     pthread_barrier_wait(&barrierFor);
                         
                         
                     Tensor<cpu, 1, real_t> mean_cpu = NewTensor<cpu, real_t>(mean.shape_, 0.0f);
                     mshadow::Copy(mean_cpu, mean, s);
-                    sharedMean.Push(mean_cpu,myRank);
+		            sharedMean.Push(mean_cpu,myRank);//printf("push mean error at %d",myRank);
                     pthread_barrier_wait(&barrierFor);
                     
                     Tensor<cpu,1,real_t> var_cpu = NewTensor<cpu, real_t>(var.shape_, 0.0f);
                     mshadow::Copy(var_cpu,var,s);
-                    sharedVar.Push(var_cpu,myRank);
-                    pthread_barrier_wait(&barrierFor);
+                    sharedVar.Push(var_cpu,myRank);//printf("push var error at %d\n",myRank);
+		            pthread_barrier_wait(&barrierFor);
                     //means and variances from different GPUs are inserted
                     
                     rankFor = 0;//reset rankFor for next BN layer
                     
                     pthread_mutex_lock(&mm);
-                    mean_cpu = sharedMean.Pop(myRank);
+		            mean_cpu = sharedMean.Pop(myRank);
                     pthread_mutex_unlock(&mm);
-                    
+                    pthread_barrier_wait(&barrierFor);
+ 
                     pthread_mutex_lock(&mm);
                     var_cpu = sharedVar.Pop(myRank);
                     pthread_mutex_unlock(&mm);
-                    
                     pthread_barrier_wait(&barrierFor);
-                    mshadow::Copy(mean,mean_cpu,s);
+                    
+                    if(myRank == 0){
+			          sharedMean.ResetMean();
+			          sharedVar.ResetMean();
+		            }
+		            pthread_barrier_wait(&barrierFor);
+
+		            mshadow::Copy(mean,mean_cpu,s);
                     mshadow::Copy(var,var_cpu,s);
                     //copy synchronized mean and var back to gpu
                 }
@@ -366,38 +382,57 @@ class BatchNormV1Op : public Operator {
                 
 
                 //Global BN using sharedTensor
-               /*
+               
                 if(param_.global_bn){
-                        
+                    sumGrad = sumGrad * 1.0f / param_.nGPUs;
+	            sumProd = sumProd * 1.0f / param_.nGPUs;   
                     pthread_mutex_lock(&mm);
-                    myRank = rankBack;
-                    rankBack += 1;
+                    if(myRank == -1){
+		    	myRank = rankBack;
+                    	rankBack += 1;
+		    }
                     pthread_mutex_unlock(&mm);
                     pthread_barrier_wait(&barrierBack);
                         
                     Tensor<cpu, 1, real_t> grad_cpu = NewTensor<cpu, real_t>(sumGrad.shape_, 0.0f);
                     mshadow::Copy(grad_cpu, sumGrad, s);
-                    sharedGrad.Push(grad_cpu,myRank);
-                    
+                    pthread_mutex_lock(&mm);
+		    sharedGrad.Push(grad_cpu,myRank);
+		    pthread_mutex_unlock(&mm);
+                    pthread_barrier_wait(&barrierBack);
+
                     Tensor<cpu,1,real_t> prod_cpu = NewTensor<cpu, real_t>(sumProd.shape_, 0.0f);
                     mshadow::Copy(prod_cpu,sumProd,s);
-                    sharedVar.Push(prod_cpu,myRank);
-                    
+                    pthread_mutex_lock(&mm);
+		    sharedProd.Push(prod_cpu,myRank);
+		   
+                    pthread_mutex_unlock(&mm);
                     pthread_barrier_wait(&barrierBack);
                     //prod and grad from different GPUs are inserted
                     
-                    rankFor = 0;//reset rankFor for next BN layer
+                    rankBack = 0;//reset rankFor for next BN layer
                     
                     pthread_mutex_lock(&mm);
                     grad_cpu = sharedGrad.Pop(myRank);
-                    prod_cpu = sharedProd.Pop(myRank);
+                    pthread_mutex_unlock(&mm);
+		    pthread_barrier_wait(&barrierBack);
+
+		    pthread_mutex_lock(&mm);
+		    prod_cpu = sharedProd.Pop(myRank);
                     pthread_mutex_unlock(&mm);
                     pthread_barrier_wait(&barrierBack);
-                    mshadow::Copy(sumGrad,grad_cpu,s);
+                    	
+		   
+                    if(myRank == 0){
+			sharedGrad.ResetMean();
+			sharedProd.ResetMean();
+		    }
+		    pthread_barrier_wait(&barrierFor);
+
+		    mshadow::Copy(sumGrad,grad_cpu,s);
                     mshadow::Copy(sumProd,prod_cpu,s);
                     //copy synchronized grad and prod back to gpu
                 }
-                */
 
              //old version global BN using NCCL   
              /*   if(param_.global_bn){
@@ -485,7 +520,7 @@ class BatchNormV1Op : public Operator {
 
     private:
         BatchNormV1Param param_;
-        int myRank;
+        int myRank=-1;
 };  // class BatchNormV1Op
 
 template<typename xpu>

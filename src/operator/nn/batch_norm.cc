@@ -114,6 +114,20 @@ void BatchNormForwardImpl(mshadow::Stream<cpu> *,
   const bool is_train_and_not_global_stats = ctx.is_train && !param_.use_global_stats;
   const size_t channelCount = inputData.ChannelCount();
   const size_t itemCountPerChannel = inputData.Size() / channelCount;
+  
+  //initialization for synchronization including : rank for each GPU, device num for sync
+  int myRank;
+  if(param_.nGPUs > 1){
+    pthread_mutex_lock(&mm);
+    myRank = rankFor;
+    rankFor++;
+    sharedVar.nDev = param_.nGPUs;
+    sharedMean.nDev = param_.nGPUs;
+    pthread_mutex_unlock(&mm);
+  }
+  pthread_barrier_wait(&barrierFor);
+  //end initialization
+  rankFor = 0;
 
   #pragma omp parallel for
   for (int channel = 0; channel < static_cast<int>(channelCount); ++channel) {
@@ -122,8 +136,17 @@ void BatchNormForwardImpl(mshadow::Stream<cpu> *,
       mean[channel] = 0;
       ForEachFast(inputData, channel, [mean, channel](const DType *in_data) {
         mean[channel] += *in_data; });
-      mean[channel] /= itemCountPerChannel;
-
+      mean[channel] /= itemCountPerChannel * param_.nGPUs;
+      // TODO sync mean here
+      
+      //push mean[channel] directly into sharedMean instead of copying back to CPU first, test if it works
+      sharedMean.Push(mean[channel],myRank);
+      pthread_barrier_wait(&barrierFor);
+      pthread_mutex_lock(&mm);
+      mean[channel] = sharedMean.Pop(myRank);
+      pthread_mutex_unlock(&mm);
+      pthread_barrier_wait(&barrierFor);
+      
       // compute variance per input
       const AccReal thisMean = mean[channel];
       var[channel] = 0;
@@ -132,7 +155,22 @@ void BatchNormForwardImpl(mshadow::Stream<cpu> *,
                     const AccReal current = *current_in_data;
                     var[channel] += (current - thisMean) * (current - thisMean);
                   });
+      //TODO sync var here
+      var[channel] /= param_.nGPUs;// division done here instead of being done in shared Mean/Var
+      sharedVar.Push(var[channel],myRank);
+      pthread_barrier_wait(&barrierFor);
+      pthread_mutex_lock(&mm);
+      var[channel] = sharedVar.Pop(myRank);
+      pthread_mutex_unlock(&mm);
+      pthread_barrier_wait(&barrierFor);
 
+      if(myRank == 0){
+          sharedMean.ResetMean();
+          sharedVar.ResetMean();
+      }
+      pthread_barrier_wait(&barrierFor);
+
+      
       const AccReal sum = var[channel];
 
       AccReal invstd;
@@ -226,6 +264,18 @@ void BatchNormBackwardImpl(mshadow::Stream<cpu> *,
   AccReal *gradBiasData = gradBias.dptr<AccReal>();
 
   const bool is_train_and_not_global_stats = ctx.is_train && !param_.use_global_stats;
+  int myRank; 
+  if(param_.nGPUs > 1){
+    pthread_mutex_lock(&mm);
+    myRank = rankBack;
+    rankBack += 1;
+    pthread_mutex_unlock(&mm);
+    pthread_barrier_wait(&barrierBack);
+    sharedGrad.nDev = param_.nGPUs;
+    sharedProd.nDev = param_.nGPUs;
+  }
+  pthread_barrier_wait(&barrierBack);
+  rankBack = 0;
 
   #pragma omp parallel for
   for (int channel = 0; channel < static_cast<int>(channelCount); ++channel) {
@@ -271,7 +321,41 @@ void BatchNormBackwardImpl(mshadow::Stream<cpu> *,
         // dL/dX = (Q(dL/dY) - dot(Y, dL/dY) * Y) / σ * w
 
         // projection of gradOutput on to output scaled by std
+        
+        
+        //TODO sync dotp and sumGradOut here
+        
+        sumGradOut /= param_.nGPUs;
+        dotp /= param_.nGPUs;
+
+        sharedGrad.Push(sumGradOut,myRank);
+        sharedProd.Push(dotp,myRank);
+        pthread_barrier_wait(&barrierBack);
+
+        pthread_mutex_lock(&mm);
+        sumGradOut = sharedGrad.Pop(myRank);
+        pthread_mutex_unlock(&mm);
+        pthread_barrier_wait(&barrierBack);
+
+        pthread_mutex_lock(&mm);
+        dotp = sharedProd.Pop(myRank);
+        pthread_mutex_unlock(&mm);
+        pthread_barrier_wait(&barrierBack);
+
+        if(myRank == 0){
+        
+            sharedGrad.ResetMean();
+            sharedProd.ResetMean();
+        
+        }
+        pthread_barrier_wait(&barrierBack);
+        
+
         const AccReal k = dotp * invstd * invstd / itemCount;
+         
+         
+
+        
         ForEachFast(inputData, gradIn, static_cast<size_t>(channel),
                     [&mean, &k](const DType *inputDataPtr, DType *gradIn_data) {
                       *gradIn_data = (*inputDataPtr - mean) * k;

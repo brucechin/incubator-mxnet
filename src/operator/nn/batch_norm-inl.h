@@ -37,6 +37,7 @@
 #include "../mshadow_op.h"
 #include "../operator_common.h"
 #include "../mxnet_op.h"
+#include "../share.h"
 
 #ifdef __GNUG__
 #pragma GCC diagnostic push
@@ -45,6 +46,19 @@
 
 namespace mxnet {
 namespace op {
+
+
+static pthread_mutex_t mm = PTHREAD_MUTEX_INITIALIZER;
+static pthread_barrier_t  barrierFor,barrierBack;
+static bool flagBarrierFor = false;
+static bool flagBarrierBack = false;
+static int rankFor = 0;
+static int rankBack = 0;
+static Share<float> sharedMean;
+static Share<float> sharedVar;
+static Share<float> sharedGrad;
+static Share<float> sharedProd;
+
 
 namespace batchnorm {
 enum BatchNormOpInputs {kData, kGamma, kBeta, kInMovingMean,
@@ -66,6 +80,7 @@ struct BatchNormParam : public dmlc::Parameter<BatchNormParam> {
   bool output_mean_var;
   int axis;
   bool cudnn_off;
+  int nGPUs;
   DMLC_DECLARE_PARAMETER(BatchNormParam) {
     DMLC_DECLARE_FIELD(eps).set_default(1e-3f)
     .describe("Epsilon to prevent div 0. "
@@ -84,6 +99,8 @@ struct BatchNormParam : public dmlc::Parameter<BatchNormParam> {
       .describe("Specify which shape axis the channel is specified");
     DMLC_DECLARE_FIELD(cudnn_off).set_default(false)
       .describe("Do not select CUDNN operator, if available");
+    DMLC_DECLARE_FIELD(nGPUs).set_default(1)
+        .describe("The count of GPUs to sync data");
   }
 
   bool operator==(const BatchNormParam& other) const {
@@ -176,6 +193,14 @@ void BatchNormForward(const OpContext &ctx, const BatchNormParam& param,
                       const std::vector<OpReqType> &req,
                       const std::vector<TBlob> &out_data,
                       const std::vector<TBlob> &aux_states) {
+  pthread_mutex_lock(&mm);
+  if(flagBarrierFor == false){
+       pthread_barrier_init(&barrierFor,NULL,param.nGPUs);
+       flagBarrierFor = true;
+  }
+  pthread_mutex_unlock(&mm);
+  pthread_barrier_wait(&barrierFor);
+    
   using namespace mshadow;
   using namespace mshadow::expr;
 
@@ -227,6 +252,16 @@ void BatchNormBackward(const OpContext &ctx, const BatchNormParam& param,
                        const std::vector<TBlob> &inputs,
                        const std::vector<OpReqType> &req,
                        const std::vector<TBlob> &outputs) {
+  
+  pthread_mutex_lock(&mm);
+  if(flagBarrierBack == false){
+       pthread_barrier_init(&barrierBack,NULL,param.nGPUs);
+       flagBarrierBack = true;
+  }
+  pthread_mutex_unlock(&mm);
+  pthread_barrier_wait(&barrierBack);
+    
+    
   CHECK_EQ(inputs.size(), 8U);
   CHECK_EQ(outputs.size(), 3U);
   std::vector<TBlob> out_grad(1);
